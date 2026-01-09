@@ -545,6 +545,31 @@ async function* generateOpenAICompatibleStream(
     }
 }
 
+// Simplified system context builder specifically for Puter
+const buildPuterSystemContext = (character: Character, userSettings: AppSettings, summary: string = ""): string => {
+    let systemText = `You are roleplaying as ${character.name}.`;
+
+    if (character.personality) {
+        systemText += `\nPersonality: ${character.personality}`;
+    }
+
+    if (character.scenario) {
+        systemText += `\nScenario: ${character.scenario}`;
+    }
+
+    if (summary && summary.trim()) {
+        systemText += `\n\nPrevious events: ${summary.trim()}`;
+    }
+
+    if (character.style) {
+        systemText += `\n\nStyle: ${character.style}`;
+    }
+
+    systemText += `\n\nStay in character and respond naturally.`;
+
+    return systemText;
+};
+
 async function* generatePuterStream(
     history: Message[],
     character: Character,
@@ -556,10 +581,11 @@ async function* generatePuterStream(
         throw new Error('Puter SDK not loaded. Please ensure the Puter.js script is included in your HTML.');
     }
 
-    const lorebookContext = getLorebookContext(history, character, settings);
-    const systemContent = buildSystemContext(character, settings, lorebookContext, summary);
+    // Use simplified system context for Puter
+    const systemContent = buildPuterSystemContext(character, settings, summary);
 
-    const SAFE_CONTEXT_LIMIT = 8192;
+    // More generous context limit for Puter
+    const SAFE_CONTEXT_LIMIT = 16000;
     const maxOutput = Number(settings.maxOutputTokens) || 1024;
     const trimmedHistory = trimHistory(history, systemContent, SAFE_CONTEXT_LIMIT, maxOutput);
 
@@ -575,64 +601,97 @@ async function* generatePuterStream(
 
     console.log('[Puter] Using model:', modelToUse);
     console.log('[Puter] Sending', messages.length, 'messages');
+    console.log('[Puter] System context length:', systemContent.length, 'chars');
 
-    try {
-        const result = await puter.ai.chat(messages, {
-            model: modelToUse,
-            temperature: Number(settings.temperature),
-            max_tokens: Number(settings.maxOutputTokens),
-            stream: settings.streamResponse
-        });
+    let attempts = 0;
+    const maxAttempts = 2;
 
-        console.log('[Puter] Raw result:', result);
-        console.log('[Puter] Result type:', typeof result);
+    while (attempts < maxAttempts) {
+        try {
+            const result = await puter.ai.chat(messages, {
+                model: modelToUse,
+                temperature: Number(settings.temperature),
+                max_tokens: Number(settings.maxOutputTokens),
+                stream: settings.streamResponse
+            });
 
-        if (settings.streamResponse) {
-            if (typeof result[Symbol.asyncIterator] === 'function') {
-                console.log('[Puter] Streaming mode: async iterator detected');
-                for await (const chunk of result) {
-                    if (signal?.aborted) throw new Error("Aborted");
-                    console.log('[Puter] Chunk:', chunk);
-                    if (chunk && typeof chunk === 'string') {
-                        yield chunk;
-                    } else if (chunk?.message?.content) {
-                        yield chunk.message.content;
-                    } else if (chunk?.content) {
-                        yield chunk.content;
-                    } else if (chunk?.text) {
-                        yield chunk.text;
+            console.log('[Puter] Raw result:', result);
+            console.log('[Puter] Result type:', typeof result);
+
+            if (settings.streamResponse) {
+                if (typeof result[Symbol.asyncIterator] === 'function') {
+                    console.log('[Puter] Streaming mode: async iterator detected');
+                    for await (const chunk of result) {
+                        if (signal?.aborted) throw new Error("Aborted");
+                        console.log('[Puter] Chunk:', chunk);
+                        if (chunk && typeof chunk === 'string') {
+                            yield chunk;
+                        } else if (chunk?.message?.content) {
+                            yield chunk.message.content;
+                        } else if (chunk?.content) {
+                            yield chunk.content;
+                        } else if (chunk?.text) {
+                            yield chunk.text;
+                        }
                     }
+                } else {
+                    console.log('[Puter] Streaming mode: no async iterator, treating as single result');
+                    const content = result?.message?.content || result?.content || result?.text || String(result);
+                    console.log('[Puter] Extracted content:', content);
+                    yield content;
                 }
             } else {
-                console.log('[Puter] Streaming mode: no async iterator, treating as single result');
+                console.log('[Puter] Non-streaming mode');
                 const content = result?.message?.content || result?.content || result?.text || String(result);
                 console.log('[Puter] Extracted content:', content);
                 yield content;
             }
-        } else {
-            console.log('[Puter] Non-streaming mode');
-            const content = result?.message?.content || result?.content || result?.text || String(result);
-            console.log('[Puter] Extracted content:', content);
-            yield content;
+
+            return;
+
+        } catch (error: any) {
+            attempts++;
+
+            if (error.name === 'AbortError' || error.message === "Aborted") throw error;
+
+            const errorMessage = error.message || String(error);
+            console.error(`[Puter] Attempt ${attempts} failed:`, errorMessage);
+
+            if (errorMessage.toLowerCase().includes('quota') ||
+                errorMessage.toLowerCase().includes('insufficient') ||
+                errorMessage.toLowerCase().includes('credit') ||
+                errorMessage.toLowerCase().includes('limit exceeded')) {
+                throw new Error('PUTER_QUOTA_EXCEEDED: You have reached your free credit limit on Puter. Please wait or upgrade your account.');
+            }
+
+            if (errorMessage.toLowerCase().includes('auth') ||
+                errorMessage.toLowerCase().includes('login') ||
+                errorMessage.toLowerCase().includes('unauthorized')) {
+                throw new Error('PUTER_AUTH_REQUIRED: Please authenticate with Puter to use this provider.');
+            }
+
+            if (errorMessage.toLowerCase().includes('safety') ||
+                errorMessage.toLowerCase().includes('content policy') ||
+                errorMessage.toLowerCase().includes('blocked') ||
+                errorMessage.toLowerCase().includes('violation')) {
+                throw new Error('Content blocked by safety filters. Try adjusting your prompt or character settings.');
+            }
+
+            const isTransient = errorMessage.includes('503') ||
+                              errorMessage.includes('429') ||
+                              errorMessage.includes('busy') ||
+                              errorMessage.includes('timeout') ||
+                              errorMessage.includes('network');
+
+            if (isTransient && attempts < maxAttempts) {
+                console.log(`[Puter] Retrying after transient error (attempt ${attempts + 1}/${maxAttempts})...`);
+                await new Promise(resolve => setTimeout(resolve, 1500 * attempts));
+                continue;
+            }
+
+            console.error('Puter AI Error:', error);
+            throw new Error(`Puter Error: ${errorMessage}`);
         }
-    } catch (error: any) {
-        if (error.name === 'AbortError' || error.message === "Aborted") throw error;
-
-        const errorMessage = error.message || String(error);
-
-        if (errorMessage.toLowerCase().includes('quota') ||
-            errorMessage.toLowerCase().includes('insufficient') ||
-            errorMessage.toLowerCase().includes('credit') ||
-            errorMessage.toLowerCase().includes('limit exceeded')) {
-            throw new Error('PUTER_QUOTA_EXCEEDED: You have reached your free credit limit on Puter. Please wait or upgrade your account.');
-        }
-
-        if (errorMessage.toLowerCase().includes('auth') || errorMessage.toLowerCase().includes('login')) {
-            throw new Error('PUTER_AUTH_REQUIRED: Please authenticate with Puter to use this provider.');
-        }
-
-        console.error('Puter AI Error:', error);
-        throw new Error(`Puter Error: ${errorMessage}`);
     }
 }
 
@@ -903,49 +962,81 @@ ${detailedSequence ? "Include a detailed event sequence." : ""}
         console.log('[Puter Character Gen] Using model:', modelToUse);
         console.log('[Puter Character Gen] Generating character profile...');
 
-        try {
-            const result = await puter.ai.chat(messages, {
-                model: modelToUse,
-                temperature: genSettings.temperature,
-                max_tokens: genSettings.maxOutputTokens,
-                stream: true
-            });
+        let attempts = 0;
+        const maxAttempts = 2;
 
-            if (typeof result[Symbol.asyncIterator] === 'function') {
-                for await (const chunk of result) {
-                    if (signal?.aborted) throw new Error("Aborted");
-                    if (chunk && typeof chunk === 'string') {
-                        yield chunk;
-                    } else if (chunk?.message?.content) {
-                        yield chunk.message.content;
-                    } else if (chunk?.content) {
-                        yield chunk.content;
-                    } else if (chunk?.text) {
-                        yield chunk.text;
+        while (attempts < maxAttempts) {
+            try {
+                const result = await puter.ai.chat(messages, {
+                    model: modelToUse,
+                    temperature: genSettings.temperature,
+                    max_tokens: genSettings.maxOutputTokens,
+                    stream: true
+                });
+
+                if (typeof result[Symbol.asyncIterator] === 'function') {
+                    for await (const chunk of result) {
+                        if (signal?.aborted) throw new Error("Aborted");
+                        if (chunk && typeof chunk === 'string') {
+                            yield chunk;
+                        } else if (chunk?.message?.content) {
+                            yield chunk.message.content;
+                        } else if (chunk?.content) {
+                            yield chunk.content;
+                        } else if (chunk?.text) {
+                            yield chunk.text;
+                        }
                     }
+                } else {
+                    const content = result?.message?.content || result?.content || result?.text || String(result);
+                    yield content;
                 }
-            } else {
-                const content = result?.message?.content || result?.content || result?.text || String(result);
-                yield content;
+
+                return;
+
+            } catch (error: any) {
+                attempts++;
+
+                if (error.name === 'AbortError' || error.message === "Aborted") throw error;
+
+                const errorMessage = error.message || String(error);
+                console.error(`[Puter Character Gen] Attempt ${attempts} failed:`, errorMessage);
+
+                if (errorMessage.toLowerCase().includes('quota') ||
+                    errorMessage.toLowerCase().includes('insufficient') ||
+                    errorMessage.toLowerCase().includes('credit') ||
+                    errorMessage.toLowerCase().includes('limit exceeded')) {
+                    throw new Error('PUTER_QUOTA_EXCEEDED: You have reached your free credit limit on Puter. Please wait or upgrade your account.');
+                }
+
+                if (errorMessage.toLowerCase().includes('auth') ||
+                    errorMessage.toLowerCase().includes('login') ||
+                    errorMessage.toLowerCase().includes('unauthorized')) {
+                    throw new Error('PUTER_AUTH_REQUIRED: Please authenticate with Puter to use this provider.');
+                }
+
+                if (errorMessage.toLowerCase().includes('safety') ||
+                    errorMessage.toLowerCase().includes('content policy') ||
+                    errorMessage.toLowerCase().includes('blocked') ||
+                    errorMessage.toLowerCase().includes('violation')) {
+                    throw new Error('Content blocked by safety filters. Try adjusting your character generation prompt.');
+                }
+
+                const isTransient = errorMessage.includes('503') ||
+                                  errorMessage.includes('429') ||
+                                  errorMessage.includes('busy') ||
+                                  errorMessage.includes('timeout') ||
+                                  errorMessage.includes('network');
+
+                if (isTransient && attempts < maxAttempts) {
+                    console.log(`[Puter Character Gen] Retrying after transient error (attempt ${attempts + 1}/${maxAttempts})...`);
+                    await new Promise(resolve => setTimeout(resolve, 1500 * attempts));
+                    continue;
+                }
+
+                console.error('Puter Character Generation Error:', error);
+                throw new Error(`Puter Error: ${errorMessage}`);
             }
-        } catch (error: any) {
-            if (error.name === 'AbortError' || error.message === "Aborted") throw error;
-
-            const errorMessage = error.message || String(error);
-
-            if (errorMessage.toLowerCase().includes('quota') ||
-                errorMessage.toLowerCase().includes('insufficient') ||
-                errorMessage.toLowerCase().includes('credit') ||
-                errorMessage.toLowerCase().includes('limit exceeded')) {
-                throw new Error('PUTER_QUOTA_EXCEEDED: You have reached your free credit limit on Puter. Please wait or upgrade your account.');
-            }
-
-            if (errorMessage.toLowerCase().includes('auth') || errorMessage.toLowerCase().includes('login')) {
-                throw new Error('PUTER_AUTH_REQUIRED: Please authenticate with Puter to use this provider.');
-            }
-
-            console.error('Puter Character Generation Error:', error);
-            throw new Error(`Puter Error: ${errorMessage}`);
         }
     } else {
          throw new Error("Character Generation not supported for this provider yet.");
